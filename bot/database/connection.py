@@ -12,6 +12,7 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
 
     async def connect(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)  # data/ yo'q bo'lsa yaratadi
         self._conn = await aiosqlite.connect(self.path)
         await self.create_tables()
 

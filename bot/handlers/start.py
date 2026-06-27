@@ -39,8 +39,17 @@ async def show_channels(message: Message, bot: Bot, admins: AdminRepo, users: Us
         )
         return
 
+    channel_ids = await channels.all_ids()
+    if not channel_ids:  # kanal yo'q — obuna talab qilinmaydi
+        await users.add(user_id)
+        await message.answer(
+            "Assalom-u alaykum <b>Foydali yordamchi [PC Mexanics]</b> botga Xush kelibsiz..! Bot xizmatingizda✅",
+            reply_markup=main_menu,
+        )
+        return
+
     links = []
-    for ch in await channels.all_ids():
+    for ch in channel_ids:
         try:
             links.append(await bot.export_chat_invite_link(ch))
         except Exception:
@@ -58,19 +67,27 @@ async def check_subs(call: CallbackQuery, bot: Bot, users: UserRepo, channels: C
     await call.answer()
     user_id = call.from_user.id  # R6 fix: avval call.message.from_id (bot id) edi
 
+    channel_ids = await channels.all_ids()
+    if not channel_ids:  # kanal yo'q — gate yo'q
+        if not await users.exists(user_id):
+            await users.add(user_id)
+        await call.message.answer("Bot xizmatingizda ✅", reply_markup=main_menu)
+        return
+
     lines = []
     links = []
     all_ok = True
-    for ch in await channels.all_ids():
+    for ch in channel_ids:
         ok = await _is_subscribed(bot, ch, user_id)
         all_ok = all_ok and ok
+        link, title = "https://t.me", "kanal"
         try:
             chat = await bot.get_chat(ch)
             link = await bot.export_chat_invite_link(ch)
-            links.append(link)
             title = chat.title
         except Exception:
-            title = "kanal"
+            pass
+        links.append(link)
         if ok:
             lines.append(f"\n<b><a href='{link}'>{title}</a></b> kanaliga obuna bo'lgansiz!✅")
         else:
