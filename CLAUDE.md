@@ -4,42 +4,51 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Telegram bot ("Foydali yordamchi [PC Mexanics]") built on **aiogram 2.22.2** (Python 3.11.9). It distributes school textbooks and PC software (links to Telegram channel posts), downloads video/media from YouTube/Instagram/TikTok, and gives admins a post-broadcasting + user-management panel. All user-facing text and most comments are in **Uzbek** — match that language when editing strings.
+A Telegram bot ("Foydali yordamchi [PC Mexanics]") on **aiogram 3.29** (Python 3.11). It distributes school textbooks and PC software (links to Telegram channel posts), downloads video/media from YouTube/Instagram/TikTok, and gives admins a post-broadcast + user/channel/admin management panel. All user-facing text and most comments are in **Uzbek** — match that language when editing strings.
+
+> Migrated from aiogram 2.22.2 to a clean layered architecture. The old flat tree (`app.py`, `loader.py`, `handlers/`, `keyboards/`, `data/post_data.py`, …) is gone; everything lives under `bot/`.
 
 ## Commands
 
 ```bash
-pip install -r requirements.txt   # requirements.txt is UTF-16 encoded; pip handles it, editors may show a BOM
-python app.py                     # run the bot (long-polling; no webhook)
-python purifier.py                # recursively delete all __pycache__ dirs
+pip install -r requirements.txt   # aiogram 3.29, aiosqlite, python-dotenv, requests
+python -m bot                     # run the bot (long-polling)
+python purifier.py                # dev tool: recursively delete __pycache__
 ```
 
-There are **no tests, linter, or build step**. `runtime.txt` (`python-3.11.9`) targets a Heroku/Railway-style deploy.
+No tests/linter/build step. `runtime.txt` (`python-3.11.9`) targets a simple deploy. Secrets come from **`.env`** (`.env.example` is the template): `BOT_TOKEN`, `RAPIDAPI_KEY` + 3 `RAPIDAPI_*_HOST`.
 
-## Architecture
+## Architecture (`bot/`)
 
-**Registration is by import side-effect.** `app.py` does `import middlewares, filters, handlers` — importing each package runs its `__init__.py`, which imports submodules, which run the `@dp.*_handler` decorators that register everything on the shared `dp`. Nothing is wired up explicitly. Consequences:
+Explicit wiring — no import-side-effect magic. `bot/__main__.py` is the single composition root:
 
-- **`loader.py` is the single source of `bot`, `dp`, and `storage`** (`MemoryStorage`, HTML parse mode). Every module imports from it. FSM state is in-memory only — a restart drops all in-progress flows.
-- **Handler order = match priority.** `handlers/__init__.py` and `handlers/users/__init__.py` control the order handlers are registered. Two near-catch-all handlers exist and order between them is load-bearing: `handlers/users/owner/creator.py` registers `@dp.message_handler(content_types=ContentType.TEXT)` (the giant `elif text == "..."` main-menu router for every reply-keyboard button), and `handlers/users/aks_holda/echo.py` is the final fallback — `echo` is imported **last** in `users/__init__.py` so it only catches unmatched text. Adding a new menu button means adding both a `KeyboardButton` in `keyboards/keyboard/all_button.py` and an `elif` branch in `creator.py`.
-- **Middlewares/filters use an unusual guard.** `middlewares/__init__.py` and `filters/__init__.py` only run their setup inside `if __name__ == "middlewares":` / `if __name__ == "filters":`. This works *only because* they are imported as top-level packages named exactly that. Don't relocate or rename these packages, and don't expect the setup to run if imported under another path.
+- Builds `Bot(default=DefaultBotProperties(parse_mode=HTML))` + `Dispatcher(MemoryStorage)`.
+- **Dependency injection via workflow data**: repositories are set as `dp["users"]`, `dp["admins"]`, `dp["channels"]`, `dp["posts"]`, `dp["elons"]`. Handlers/filters/middlewares receive them by parameter name (e.g. `async def h(message, admins: AdminRepo)`). `bot` is auto-injected by aiogram.
+- Registers middlewares, then `dp.include_router(setup_routers())`.
 
-**Force-subscription gate.** `middlewares/checksub.py` (`BigBrother`, `on_pre_process_update`) blocks every update except `/start`, `/help`, and the `check_subs` callback until the user is subscribed to all `CHANNELS`; non-subscribers get invite buttons and the handler is cancelled via `CancelHandler()`. `ThrottlingMiddleware` (`middlewares/throttling.py`) is the standard aiogram anti-flood.
+**Data layer** (`bot/database/`): `connection.py` holds one shared `aiosqlite` connection (`Database`) with `create_tables()` (idempotent, runs on startup). `repositories.py` is one class per table (`UserRepo`, `AdminRepo`, `ChannelRepo`, `PostRepo`, `ElonRepo`) — all DB access goes through these. **Schema and data file (`data/database.sqlite3`) are unchanged from the old version**; tables: `obunachilar`, `owner`, `channels_data`, `for_post`, `for_elon`.
 
-**Data layer.** `data/post_data.py` defines a hand-rolled `Database` wrapper over `sqlite3` and exports a module-level singleton `db` (DB file: `data/database.sqlite3`, resolved relative to that file). Tables:
-- `obunachilar` — subscribers (`tg_user`)
-- `owner` — admins (`admin`)
-- `channels_data` — required-subscription channels (`channel_id`, negative Telegram IDs)
-- `for_post` — staged media posts (`admin_id`, `file_id`, `caption`)
-- `for_elon` — staged text announcements (`id_raqami`, `elon`)
+**Router order is load-bearing** (`bot/handlers/__init__.py` `setup_routers()`): `errors.router` is used as the **root** (errors bubble up to it, so its `@router.errors` handlers catch everything), feature routers are included into it, and `menu.router` is **last** because it contains the catch-all `echo`. Anything that must beat `echo` (catalog sends, admin buttons, broadcast) is included before it.
 
-**Config is read from the DB at import time.** `data/config.py` sets `BOT_TOKEN` (hardcoded) and computes `ADMINS`/`CHANNELS` via `list(*zip(*db.admin_view()))` / `db.channel_view()` when the module is first imported. So `ADMINS`/`CHANNELS` are **snapshots** — admin/channel rows added at runtime are written to the DB but won't appear in these lists until the process restarts. Code that needs live admin checks uses `db.is_admin(...)` directly instead.
+**aiogram-3 conventions used throughout:**
+- `@router.message(F.text == "...")`, `Command(...)`, `CommandStart()`; state via `StateFilter(...)` or passing the `State` positionally.
+- **Every non-state handler carries `StateFilter(None)`** — in v3 a handler without it fires in *all* states and would steal input mid-FSM. Keep this when adding handlers.
+- `CallbackData` subclasses in `bot/keyboards/callbacks.py` (`PostCB`, `AdminPostCB`, `ChannelCB`, `DeleteCB`, `TaklifCB`, `BotPostCB`); filter with `X.filter(F.action == ...)`, build with `X(...).pack()`.
+- Keyboards: reply menus in `keyboards/reply.py` (explicit `ReplyKeyboardMarkup`), inline in `keyboards/inline.py` (`InlineKeyboardBuilder` for dynamic ones).
+- `IsAdmin` filter (`bot/filters/is_admin.py`) queries the DB **live** every time — there is no `ADMINS`/`CHANNELS` snapshot, so runtime admin/channel changes take effect without restart.
 
-**Media downloads.** `handlers/users/yt_insta_tiktok/download.py` routes a pasted URL by prefix to functions in `all_request.py`, which call **RapidAPI** endpoints (Instagram/TikTok/YouTube) with a hardcoded `X-RapidAPI-Key`. `pytube` is used only to normalize a YouTube URL into a `videoId`. Each branch is wrapped in `try/except` that replies with a generic failure message.
+**Middlewares** (`bot/middlewares/`): `subscription.py` is a typed `outer_middleware` on `dp.update` — the force-subscription gate; it lets `/start`, `/help`, and the `check_subs` callback through, otherwise requires membership in all `channels_data` (only in private chats). `throttling.py` is a per-user TTL anti-flood on `dp.message`.
 
-## Gotchas
+**Content catalog** (`bot/content/catalog.py`): the ~70 "button → document/photo(s)" entries are pure data (`BOOKS`, `SOFTWARE` dicts of `Item`). `handlers/user/books.py` and `software.py` are thin — one dict lookup replaces the old 950-line elif chain. Adding a download = add a `catalog.py` entry (and a `reply.py` button if it needs one); no handler code.
 
-- **Secrets are committed in source**: `BOT_TOKEN` in `data/config.py` and the `X-RapidAPI-Key` in `handlers/users/yt_insta_tiktok/all_request.py`. Treat them as live; don't paste them elsewhere.
-- **The new-post flow uses module-level mutable dicts** (`user_entity`, `analiz`, `btn_text`, `tugmalar`) in `handlers/users/yangi_pst/newpost.py` as cross-handler scratch state. These are **global, not per-user** — concurrent admins building posts simultaneously will clobber each other. Per-message data goes through aiogram's `state.proxy()`/`update_data`; this global dict is the post-construction working set.
-- **`newpost.py` and `creator.py` swallow exceptions broadly** and DM the admins a hardcoded `[ Line: NN ]` marker on failure; those line numbers are stale and don't track edits.
-- The bot only responds in `private` chats for most handlers (`if message.chat.type == "private"`); group/channel updates are largely ignored.
+**Broadcast** (`bot/handlers/admin/broadcast.py`): post-building state lives entirely in **FSM** (`state.update_data`), not module globals — concurrent admins don't clash. Publishing uses **`bot.copy_message` / `message.copy_to`** (single message, with optional `reply_markup`) or **`bot.copy_messages`** (album), which preserve the original formatting — so there is no per-content-type branching and no manual entity handling. Supports text / photo / video / document / voice and **albums** (media groups). Targets are resolved by `_targets()` from the FSM `sort` (`first_chanel` / `in_bot` / `all_chanel` / specific `channel_id`). **Album limitations**: inline buttons can't attach to an album (Telegram), and album *user-suggestions* (Taklif) are rejected (only single-message suggestions go through the admin-approval flow).
+
+**Albums** (`bot/middlewares/album.py`): Telegram delivers a media group as separate messages; `AlbumMiddleware` (outer, on `dp.message`) debounces them by `media_group_id` and hands the full list to the handler as `album: list[Message]`. `ThrottlingMiddleware` skips `media_group_id` messages so album bursts aren't dropped.
+
+## Conventions & gotchas
+
+- **Secrets were exposed before the `.env` migration and were committed in git history** — the `BOT_TOKEN` and `RAPIDAPI_KEY` should be rotated (BotFather `/revoke`; RapidAPI regenerate). `.env` and `data/database.sqlite3` are gitignored.
+- Navigation reply-button texts (`Asosiy Bo`lim⬅️`, `Asosiy bo`lim💡`, `🔙Orqaga⬅️`, `Orqaga🔧`, …) are intentionally distinct — they encode position in the menu tree (each returns to a *specific* parent), so they're not collapsed to one "back". `menu.py` `NAV` maps each to its target keyboard.
+- Reply-button texts must stay byte-identical across `reply.py`, `content/catalog.py` keys, and the `F.text == ...` / `NAV` handlers — a mismatch silently routes to `echo`.
+- `RAPIDAPI` calls use blocking `requests` wrapped in `asyncio.to_thread` (`handlers/user/download.py`); YouTube `videoId` is parsed by regex (pytube was dropped).
+- Error handlers are registered on the **root** router; per-leaf-router error handlers would only catch their own router's errors.
